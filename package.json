@@ -1,0 +1,9 @@
+{
+  "name": "hiyoka-agent",
+  "version": "1.0.0",
+  "description": "Hiyoka Agent - penghubung VPS ke bot Hiyoka (Pterodactyl)",
+  "main": "agent.js",
+  "scripts": { "start": "node agent.js" },
+  "engines": { "node": ">=22" },
+  "dependencies": { "ws": "^8.18.0" }
+}
