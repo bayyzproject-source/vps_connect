@@ -1,6 +1,6 @@
 'use strict';
 // Hiyoka Agent - jalan di VPS (pm2: hiyoka-agent). Connect KELUAR ke bot Hiyoka (Pterodactyl) lewat
-// WebSocket terenkripsi, lalu mengerjakan perintah dari bot: file manager, pm2 restart, cek API, backup.
+// WebSocket terenkripsi, lalu mengerjakan perintah dari bot: file manager dan uninstall agent (/disconnect).
 // Semua pengaturan ada di agent.conf. Tidak ada port yang dibuka di VPS.
 
 const fs = require('fs');
@@ -10,7 +10,7 @@ const { spawn } = require('child_process');
 const WebSocket = require('ws');
 const { masterKey, randomNonce, sessionKeys, Channel } = require('./proto');
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const AGENT_DIR = __dirname;
 const MB = 1024 * 1024;
 const log = (...a) => console.log(new Date().toISOString().replace('T', ' ').slice(0, 19), '[agent]', ...a);
@@ -35,10 +35,6 @@ const SECRET = conf.HIYOKA_SECRET || '';
 const ROOT = path.resolve(conf.UPLOAD_ROOT || '/root');
 const KURO_DIR = path.resolve(conf.KURO_DIR || '/root/kuronime-api');
 const ENV_PATH = path.join(KURO_DIR, '.env');
-const LOCAL = String(conf.KURO_API || 'http://127.0.0.1:3000').replace(/\/$/, '');
-const API_PM2 = conf.KURO_PM2 || 'kuronime-api';
-const BACKUP_SCRIPT = conf.BACKUP_SCRIPT || 'backup.sh';
-const BACKUP_TIMEOUT = (Number(conf.BACKUP_TIMEOUT_MIN) || 10) * 60 * 1000;
 const MAX_UNZIPPED = (Number(conf.MAX_UNZIPPED_MB) || 200) * MB;
 const MAX_ENTRIES = Number(conf.MAX_ZIP_ENTRIES) || 5000;
 const HARD_CAP = 100 * MB;
@@ -46,7 +42,7 @@ const HARD_CAP = 100 * MB;
 if (!HOST || !PORT) { console.error('HIYOKA_HOST / HIYOKA_PORT belum diisi di agent.conf'); process.exit(1); }
 if (SECRET.length < 16) { console.error('HIYOKA_SECRET di agent.conf minimal 16 karakter'); process.exit(1); }
 if (process.argv.includes('--check')) {
-  console.log(`OK konfigurasi: bot ws://${HOST}:${PORT} | root ${ROOT} | kuronime ${KURO_DIR} | pm2 ${API_PM2}`);
+  console.log(`OK konfigurasi: bot ws://${HOST}:${PORT} | root ${ROOT}`);
   process.exit(0);
 }
 
@@ -64,7 +60,7 @@ const isProtectedName = (name) => /^\.env($|\.(?!example$))/i.test(name);
 const isHidden = (n) => n.startsWith('.') && !ALLOWED_DOT.has(n.toLowerCase());
 const isHiddenBlocked = (name) => isHidden(name) && !isProtectedName(name);
 
-// file rahasia: agent.conf (berisi secret) dan .env kuronime-api. Tidak boleh didownload / ditimpa / dihapus lewat bot
+// file rahasia: agent.conf (berisi secret) dan .env di folder KURO_DIR. Tidak boleh didownload / ditimpa / dihapus lewat bot
 const SECRET_FILES = [path.join(AGENT_DIR, 'agent.conf'), ENV_PATH];
 function isSecretFile(abs) {
   const cands = new Set([path.resolve(abs)]);
@@ -116,35 +112,6 @@ function runCmd(cmd, args, timeoutMs = 60000, opt = {}) {
     });
     c.on('close', (code) => { clearTimeout(t); resolve({ code, out }); });
   });
-}
-
-// ---------- .env kuronime-api (hanya API_KEY) ----------
-const ENV_NAMES = new Set(['API_KEY']);
-function readEnv(name) {
-  try {
-    const hit = fs.readFileSync(ENV_PATH, 'utf8').split(/\r?\n/).filter((l) => l.startsWith(name + '=')).pop();
-    return hit ? hit.slice(name.length + 1).trim().replace(/^(['"])(.*)\1$/, '$2') : '';
-  } catch (_) {
-    return '';
-  }
-}
-function writeEnv(name, value) {
-  let lines = [];
-  try { lines = fs.readFileSync(ENV_PATH, 'utf8').split(/\r?\n/); } catch (_) {}
-  while (lines.length && lines[lines.length - 1] === '') lines.pop();
-  const out = [];
-  let done = false;
-  for (const l of lines) {
-    if (l.startsWith(name + '=')) {
-      if (!done) out.push(`${name}=${value}`);
-      done = true;
-    } else out.push(l);
-  }
-  if (!done) out.push(`${name}=${value}`);
-  const tmp = ENV_PATH + '.tmp';
-  fs.writeFileSync(tmp, out.join('\n') + '\n', { mode: 0o600 });
-  fs.renameSync(tmp, ENV_PATH);
-  fs.chmodSync(ENV_PATH, 0o600);
 }
 
 // ---------- operasi file ----------
@@ -320,80 +287,19 @@ function opRename(a) {
   return { name };
 }
 
-// ---------- operasi API / pm2 / backup / sistem ----------
-async function opHttp(a) {
-  const p = String(a.path || '');
-  if (!p.startsWith('/') || p.startsWith('//') || /[\s\0]/.test(p)) throw new RpcError('Path API tidak valid.');
-  const headers = {};
-  if (a.auth === 'env') {
-    const k = readEnv('API_KEY');
-    if (k) headers['x-api-key'] = k;
-  } else if (a.auth === 'key' && typeof a.key === 'string' && a.key) headers['x-api-key'] = a.key;
-  const timeout = Math.min(Math.max(Number(a.timeoutMs) || 10000, 1000), 120000);
-  const t0 = Date.now();
-  try {
-    const res = await fetch(LOCAL + p, { headers, signal: AbortSignal.timeout(timeout) });
-    const body = await res.json().catch(() => null);
-    return { ok: res.ok, status: res.status, body, ms: Date.now() - t0 };
-  } catch (e) {
-    throw new RpcError(e.name === 'TimeoutError' ? 'timeout API' : e.message, { code: e.name === 'TimeoutError' ? 'TIMEOUT' : undefined });
-  }
+// ---------- uninstall agent (dipanggil /disconnect dari bot) ----------
+function opUninstall() {
+  setTimeout(() => {
+    stopping = true;
+    try { ws && ws.close(); } catch (_) {}
+    const c = spawn('bash', ['-c', 'pm2 delete hiyoka-agent >/dev/null 2>&1; pm2 save >/dev/null 2>&1'], { detached: true, stdio: 'ignore' });
+    c.unref();
+    setTimeout(() => process.exit(0), 3000);
+  }, 800);
+  return { ok: true };
 }
 
-const PROBE_UA = 'Mozilla/5.0 (Linux; Android 13; SM-A135F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
-async function opProbe(a) {
-  if (!/^https?:\/\//i.test(String(a.url || ''))) throw new RpcError('URL tidak valid.');
-  const timeoutMs = Math.min(Math.max(Number(a.timeoutMs) || 8000, 1000), 30000);
-  const t0 = Date.now();
-  try {
-    const res = await fetch(a.url, {
-      headers: { 'User-Agent': PROBE_UA, Range: 'bytes=0-1', ...(a.headers && typeof a.headers === 'object' ? a.headers : {}) },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const ms = Date.now() - t0;
-    try { await res.body?.cancel(); } catch (_) {}
-    const html = /text\/html/i.test(res.headers.get('content-type') || '');
-    const good = (res.status === 200 || res.status === 206) && !html;
-    return { ok: good, status: res.status, ms, note: html ? 'respon HTML, bukan video' : '' };
-  } catch (e) {
-    return { ok: false, status: 0, ms: Date.now() - t0, note: e.name === 'TimeoutError' ? 'timeout' : e.message };
-  }
-}
-
-async function opPm2Restart(a) {
-  if (a.target !== 'api') throw new RpcError('Target restart tidak dikenal.');
-  const r = await runCmd('pm2', ['restart', API_PM2], 60000);
-  return { ok: r.code === 0, msg: stripAnsi(r.out).trim().split('\n').slice(-3).join('\n') };
-}
-
-let backupRunning = false;
-async function opBackup(a) {
-  if (backupRunning) throw new RpcError('Backup sebelumnya masih berjalan.');
-  const pass = String(a.pass || '');
-  if (pass.length > 128) throw new RpcError('Password terlalu panjang.');
-  backupRunning = true;
-  try {
-    const env = { ...process.env, BACKUP_PASS: pass }; // BACKUP_PASS kosong = tanpa password
-    const r = await runCmd('bash', [BACKUP_SCRIPT, 'auto'], BACKUP_TIMEOUT, { cwd: KURO_DIR, env });
-    return { code: r.code, out: stripAnsi(r.out).trim().split('\n').slice(-8).join('\n').slice(-800) };
-  } finally {
-    backupRunning = false;
-  }
-}
-
-function opEnvGet(a) {
-  if (!ENV_NAMES.has(a.name)) throw new RpcError('Variabel tidak diizinkan.');
-  return { value: readEnv(a.name) };
-}
-function opEnvSet(a) {
-  if (!ENV_NAMES.has(a.name)) throw new RpcError('Variabel tidak diizinkan.');
-  const v = String(a.value == null ? '' : a.value);
-  if (!/^[A-Za-z0-9_.~-]{0,64}$/.test(v)) throw new RpcError('Nilai tidak valid.');
-  writeEnv(a.name, v);
-  return {};
-}
-
+// ---------- sistem ----------
 const opSys = () => ({
   load: os.loadavg()[0],
   cpus: os.cpus().length,
@@ -404,12 +310,7 @@ const opSys = () => ({
 
 const OPS = {
   sys: opSys,
-  'env.get': opEnvGet,
-  'env.set': opEnvSet,
-  http: opHttp,
-  probe: opProbe,
-  'pm2.restart': opPm2Restart,
-  'backup.run': opBackup,
+  'agent.uninstall': opUninstall,
   'fs.list': opList,
   'fs.stat': opStat,
   'fs.protected': (a) => ({ why: protectedReason(a.rel) }),
@@ -456,7 +357,7 @@ function connect() {
         const k = sessionKeys(MASTER, myNonce, m.n);
         ch = new Channel(k.a2b, k.b2a);
         st = 'ack';
-        sock.send(ch.seal({ t: 'ready', info: { host: os.hostname(), root: ROOT, ver: VERSION, node: process.version, kuro: KURO_DIR, pm2: API_PM2 } }));
+        sock.send(ch.seal({ t: 'ready', info: { host: os.hostname(), root: ROOT, ver: VERSION, node: process.version } }));
         return;
       }
       if (!isBinary) throw new Error('frame teks tidak diharapkan');
@@ -511,5 +412,5 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 }
 process.on('unhandledRejection', (e) => log('unhandled:', e && e.message ? e.message : e));
 
-log(`Hiyoka Agent v${VERSION} | root ${ROOT} | kuronime ${KURO_DIR}`);
+log(`Hiyoka Agent v${VERSION} | root ${ROOT}`);
 connect();

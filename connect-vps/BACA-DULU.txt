@@ -11,13 +11,13 @@ Agent connect KELUAR ke bot, jadi tidak ada port yang dibuka di VPS ini.
 
 Perintah:
    bash run.sh status      lihat status + log
-   bash run.sh uninstall   hentikan dan hapus dari pm2
+   bash run.sh uninstall   hentikan dan hapus dari pm2 (atau dari bot: /disconnect ip)
    pm2 logs hiyoka-agent   log agent
 
 Pengaturan di agent.conf (edit lalu: pm2 restart hiyoka-agent):
    HIYOKA_HOST / HIYOKA_PORT   alamat bot di Pterodactyl
    HIYOKA_SECRET               harus sama dengan vpsLink.secret di config.js bot
-   KURO_DIR / KURO_API / KURO_PM2 / BACKUP_SCRIPT   proyek kuronime-api
+   KURO_DIR                    folder yang dilindungi dari hapus/rename lewat bot
    UPLOAD_ROOT                 batas folder file manager
 
 Keamanan:
